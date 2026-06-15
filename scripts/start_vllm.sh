@@ -7,7 +7,21 @@ set -euo pipefail
 
 MODEL="Qwen/Qwen3-30B-A3B-Instruct-2507"
 
-exec uv run python -m vllm.entrypoints.openai.api_server \
-    --model "$MODEL" \
-    --host 0.0.0.0 \
-    --port 8000
+sudo docker run --rm \
+  --runtime nvidia \
+  --gpus all \
+  --ipc=host \
+  -p 8000:8000 \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  --entrypoint python3 \
+  vllm/vllm-openai:latest \
+  -m vllm.entrypoints.openai.api_server \
+  --model "$MODEL" \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --dtype auto \
+  --max-model-len 4096 \
+  --gpu-memory-utilization 0.92 \
+  --max-num-seqs 128 \
+  --enable-chunked-prefill \
+  --enable-prefix-caching

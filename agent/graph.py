@@ -61,6 +61,10 @@ def llm() -> ChatOpenAI:
         base_url=VLLM_BASE_URL,
         api_key=LLM_API_KEY,
         temperature=0.0,
+        max_tokens=512,
+        # Disable Qwen3 thinking mode: thinking tokens add 2-4s per call and
+        # can push total token count past max_model_len on longer schemas.
+        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
     )
 
 
@@ -81,7 +85,7 @@ def _extract_sql(text: str) -> str:
     return (fenced.group(1) if fenced else text).strip()
 
 
-def generate_sql_node(state: AgentState) -> dict:
+async def generate_sql_node(state: AgentState) -> dict:
     """Worked example - the other LLM nodes follow this same shape.
 
     Build messages from the prompts, call the shared llm(), extract the SQL,
@@ -91,7 +95,7 @@ def generate_sql_node(state: AgentState) -> dict:
     This node is wired and ready; fill in GENERATE_SQL_SYSTEM / GENERATE_SQL_USER
     in prompts.py to make it produce real queries.
     """
-    response = llm().invoke([
+    response = await llm().ainvoke([
         ("system", prompts.GENERATE_SQL_SYSTEM),
         ("user", prompts.GENERATE_SQL_USER.format(
             schema=state.schema,
@@ -111,23 +115,54 @@ def execute_node(state: AgentState) -> dict:
     return {"execution": execute_sql(state.db_id, state.sql)}
 
 
-def verify_node(state: AgentState) -> dict:
+async def verify_node(state: AgentState) -> dict:
     """Decide whether state.execution plausibly answers state.question.
 
-    Follow the generate_sql_node pattern: build messages from the VERIFY_*
-    prompts, call llm(), parse the reply. Ask the model for a small JSON object
-    like {"ok": bool, "issue": str} and parse it defensively - the model may
-    wrap it in prose or fences. state.execution.render() gives you a compact
-    view of the rows or error to feed into the prompt.
+    Fast path: if execution succeeded and returned >0 rows, accept immediately
+    without an LLM call. This halves LLM calls for the common case and is the
+    primary lever for meeting the 10 RPS / P95<5s SLO.
+
+    Slow path: SQL error or 0 rows → ask the LLM to diagnose so revise_node
+    gets a useful issue description.
 
     Return: {"verify_ok": <bool>, "verify_issue": <str>}.
-    What counts as "not plausible" is yours to define - see the Phase 3 targets
-    in the README.
     """
-    raise NotImplementedError("Implement in Phase 3")
+    if not state.execution:
+        return {"verify_ok": False, "verify_issue": "No execution result"}
+
+    # Fast-path heuristic: SQL ran and returned rows → likely correct
+    if state.execution.ok and state.execution.row_count > 0:
+        return {"verify_ok": True, "verify_issue": ""}
+
+    # Slow-path: SQL error or 0 rows → use LLM to diagnose the problem
+    result_text = state.execution.render()
+    response = await llm().ainvoke([
+        ("system", prompts.VERIFY_SYSTEM),
+        ("user", prompts.VERIFY_USER.format(
+            question=state.question,
+            sql=state.sql,
+            result=result_text,
+        )),
+    ])
+
+    # Parse defensively — model may wrap JSON in prose or fences
+    raw = response.content.strip()
+    json_match = re.search(r'\{[^{}]*"ok"\s*:\s*(true|false)[^{}]*\}', raw, re.DOTALL)
+    if json_match:
+        import json
+        try:
+            parsed = json.loads(json_match.group(0))
+            ok = bool(parsed.get("ok", False))
+            issue = str(parsed.get("issue", ""))
+            return {"verify_ok": ok, "verify_issue": issue}
+        except Exception:
+            pass
+
+    # Fallback: if we can't parse, treat as failed and let revise try
+    return {"verify_ok": False, "verify_issue": f"Could not parse verifier response: {raw[:200]}"}
 
 
-def revise_node(state: AgentState) -> dict:
+async def revise_node(state: AgentState) -> dict:
     """Produce a revised SQL query given state.verify_issue and the prior attempt.
 
     Same shape as generate_sql_node, but the prompt should include the failing
@@ -137,7 +172,24 @@ def revise_node(state: AgentState) -> dict:
 
     Return: {"sql": <str>, "iteration": state.iteration + 1, ...}.
     """
-    raise NotImplementedError("Implement in Phase 3")
+    result_text = state.execution.render() if state.execution else "ERROR: no execution result"
+    response = await llm().ainvoke([
+        ("system", prompts.REVISE_SYSTEM),
+        ("user", prompts.REVISE_USER.format(
+            schema=state.schema,
+            question=state.question,
+            iteration=state.iteration,
+            sql=state.sql,
+            result=result_text,
+            issue=state.verify_issue,
+        )),
+    ])
+    sql = _extract_sql(response.content)
+    return {
+        "sql": sql,
+        "iteration": state.iteration + 1,
+        "history": state.history + [{"node": "revise", "sql": sql, "issue": state.verify_issue}],
+    }
 
 
 def route_after_verify(state: AgentState) -> str:
@@ -146,7 +198,9 @@ def route_after_verify(state: AgentState) -> str:
     Two reasons to end: the verifier was happy (state.verify_ok), or you've hit
     the iteration cap (state.iteration >= MAX_ITERATIONS). Otherwise, revise.
     """
-    raise NotImplementedError("Implement in Phase 3")
+    if state.verify_ok or state.iteration >= MAX_ITERATIONS:
+        return "end"
+    return "revise"
 
 
 # ---- Graph wiring -----------------------------------------------------

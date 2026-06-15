@@ -19,14 +19,17 @@ load_dotenv()
 
 from agent.graph import AgentState, graph  # noqa: E402
 
-# Langfuse callback handler. If keys are set we initialize it; failures
-# are NOT swallowed - a misconfigured Langfuse should not silently
-# produce zero traces.
-_lf_handler: Any = None
-if os.environ.get("LANGFUSE_PUBLIC_KEY") and os.environ.get("LANGFUSE_SECRET_KEY"):
-    from langfuse.langchain import CallbackHandler
+_langfuse_enabled: bool = bool(
+    os.environ.get("LANGFUSE_PUBLIC_KEY") and os.environ.get("LANGFUSE_SECRET_KEY")
+)
 
-    _lf_handler = CallbackHandler()
+
+def _make_lf_handler() -> Any:
+    """Create a per-request Langfuse handler. Each handler tracks one trace."""
+    if not _langfuse_enabled:
+        return None
+    from langfuse.langchain import CallbackHandler  # noqa: PLC0415
+    return CallbackHandler()
 
 
 app = FastAPI()
@@ -53,14 +56,15 @@ def health() -> dict[str, str]:
 
 
 @app.post("/answer", response_model=AnswerResponse)
-def answer(req: AnswerRequest) -> AnswerResponse:
+async def answer(req: AnswerRequest) -> AnswerResponse:
     state = AgentState(question=req.question, db_id=req.db)
+    lf_handler = _make_lf_handler()
     config: dict[str, Any] = {
-        "callbacks": [_lf_handler] if _lf_handler is not None else [],
+        "callbacks": [lf_handler] if lf_handler is not None else [],
         "metadata": req.tags,
     }
     try:
-        final = graph.invoke(state, config=config)
+        final = await graph.ainvoke(state, config=config)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
