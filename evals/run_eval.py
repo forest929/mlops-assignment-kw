@@ -58,7 +58,56 @@ def matches(gold_rows: list[tuple] | None, pred_rows: list[tuple] | None) -> boo
 
 def eval_one(question: dict, agent_url: str) -> dict:
     """Score one question. Return a dict capturing per-iteration correctness."""
-    raise NotImplementedError("Phase 5")
+    db_id = question["db_id"]
+    gold_sql = question["gold_sql"]
+
+    gold_ok, gold_rows, gold_err = run_sql(db_id, gold_sql)
+
+    try:
+        resp = httpx.post(
+            agent_url,
+            json={"question": question["question"], "db": db_id, "tags": {"phase": "5-eval"}},
+            timeout=180,
+        )
+        resp.raise_for_status()
+        agent_resp = resp.json()
+    except Exception as e:  # noqa: BLE001
+        return {
+            "question": question["question"],
+            "db_id": db_id,
+            "gold_sql": gold_sql,
+            "agent_error": str(e),
+            "iterations": 0,
+            "per_iter_correct": [],
+            "correct": False,
+            "gold_ok": gold_ok,
+            "gold_error": gold_err,
+        }
+
+    history = agent_resp.get("history", [])
+
+    # Check correctness at each iteration (generate_sql = iter 0, revise = iter 1, 2, ...)
+    per_iter_correct: list[bool] = []
+    for entry in history:
+        sql = entry.get("sql", "")
+        ok, rows, _ = run_sql(db_id, sql)
+        per_iter_correct.append(bool(ok and matches(gold_rows, rows)))
+
+    final_correct = per_iter_correct[-1] if per_iter_correct else False
+
+    return {
+        "question": question["question"],
+        "db_id": db_id,
+        "gold_sql": gold_sql,
+        "agent_sql": agent_resp.get("sql", ""),
+        "agent_ok": agent_resp.get("ok", False),
+        "iterations": agent_resp.get("iterations", 0),
+        "history": history,
+        "per_iter_correct": per_iter_correct,
+        "correct": final_correct,
+        "gold_ok": gold_ok,
+        "gold_error": gold_err,
+    }
 
 
 def summarize(results: list[dict]) -> dict:
@@ -70,7 +119,31 @@ def summarize(results: list[dict]) -> dict:
     The agent stopped emitting; whatever it had at termination is what
     would have been served had we polled at iteration k.
     """
-    raise NotImplementedError("Phase 5")
+    n = len(results)
+    if n == 0:
+        return {"n": 0}
+
+    max_iters = max((len(r.get("per_iter_correct", [])) for r in results), default=0)
+
+    per_iter_pass_rate: dict[str, float] = {}
+    for k in range(max_iters):
+        correct_at_k = 0
+        for r in results:
+            pic = r.get("per_iter_correct", [])
+            # carry-forward: if agent stopped before iteration k, use its last answer
+            val = pic[k] if k < len(pic) else (pic[-1] if pic else False)
+            if val:
+                correct_at_k += 1
+        per_iter_pass_rate[f"iter_{k}"] = round(correct_at_k / n, 4)
+
+    n_correct = sum(1 for r in results if r.get("correct", False))
+
+    return {
+        "n": n,
+        "n_correct": n_correct,
+        "overall_pass_rate": round(n_correct / n, 4),
+        "per_iter_pass_rate": per_iter_pass_rate,
+    }
 
 
 # ---------- Main (provided) --------------------------------------------

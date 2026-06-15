@@ -159,8 +159,15 @@ services:
       <<: *langfuse-env
       NEXTAUTH_URL: http://localhost:3001
       NEXTAUTH_SECRET: course-nextauth-not-for-prod
-      LANGFUSE_INIT_ORG_NAME: Course
-      LANGFUSE_INIT_PROJECT_NAME: Default
+      LANGFUSE_INIT_ORG_ID: org-mlops-hw3
+      LANGFUSE_INIT_ORG_NAME: mlops-hw3
+      LANGFUSE_INIT_PROJECT_ID: proj-text-to-sql
+      LANGFUSE_INIT_PROJECT_NAME: text-to-sql
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: pk-lf-mlops-hw3
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: sk-lf-mlops-hw3
+      LANGFUSE_INIT_USER_EMAIL: kexinwang929@gmail.com
+      LANGFUSE_INIT_USER_NAME: Kexin
+      LANGFUSE_INIT_USER_PASSWORD: mlops2024!
 
 volumes:
   prometheus-data:
